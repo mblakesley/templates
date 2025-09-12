@@ -1,0 +1,128 @@
+name: Run "Terraform Plan" for Service X
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+  workflow_dispatch:  # Allow manual triggering
+
+permissions:
+  contents: read  # For checking out private repos
+  id-token: write  # For AWS OIDC
+  pull-requests: write  # For making a PR comment
+
+jobs:
+  terraform-plan:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - environment: development
+            aws_acct_id: 123
+          - environment: production
+            aws_acct_id: 456
+      fail-fast: false
+
+    env:
+      IS_CICD_ROLE: true
+
+    steps:
+      - name: Hide previous comments from Github Bot
+        uses: kanga333/comment-hider@v0.4.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        id: configure-aws
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ matrix.aws_acct_id }}:role/BCI-Infrastructure-Github-Terraform
+          role-session-name: service-x-terraform-plan
+          aws-region: us-east-2
+
+      - name: Set Terraform and Terragrunt versions from .tool-versions
+        id: set-versions
+        run: |
+          echo "TF_VERSION=$(grep terraform .tool-versions | cut -d ' ' -f2)" >> $GITHUB_OUTPUT
+          echo "TG_VERSION=$(grep terragrunt .tool-versions | cut -d ' ' -f2)" >> $GITHUB_OUTPUT
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3.1.2
+        with:
+          terraform_version: ${{ steps.set-versions.outputs.TF_VERSION }}
+
+      - name: Install Terragrunt
+        uses: autero1/action-terragrunt@v3.0.2
+        with:
+          terragrunt_version: ${{ steps.set-versions.outputs.TG_VERSION }}
+
+      - name: Terraform init
+        id: tf_init
+        working-directory: terraform/environments/${{ matrix.environment }}/
+        run: terragrunt init -no-color
+
+      - name: Terraform plan
+        id: tf_plan
+        working-directory: terraform/environments/${{ matrix.environment }}/
+        run: terragrunt plan -no-color -out=plan.out
+
+      - name: Export Plan output to Github env var
+        id: export_plan_output
+        if: always()
+        working-directory: terraform/environments/${{ matrix.environment }}/
+        run: |
+          if [ "${{ steps.tf_init.outcome }}" == "failure" ]; then
+            PLAN='${{ steps.tf_init.outputs.stdout }}${{ steps.tf_init.outputs.stderr }}'
+          elif [ "${{ steps.tf_plan.outcome }}" == "failure" ]; then
+            PLAN='${{ steps.tf_plan.outputs.stdout }}${{ steps.tf_plan.outputs.stderr }}'
+          else
+            PLAN=$(terragrunt show plan.out -no-color)
+          fi
+
+          # Format plan output like Atlantis: move +/-/~ to front(-ish) of line and change ~ to !
+          PLAN=$(echo "$PLAN" | sed 's|^\([ ]*\)\(  [-+~]\)|\2\1|g' | sed 's|^  \~|  !|g')
+
+          echo "PLAN<<EOF" >> $GITHUB_OUTPUT
+          echo "$PLAN" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Add PR comment on successful plan
+        if: ${{ !failure() }}
+        uses: peter-evans/create-or-update-comment@v4.0.0
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            :pencil2: Terraform Plan for `${{ matrix.environment }}`:
+            <details>
+              <summary>Show Plan</summary>
+
+              ```diff
+              ${{ steps.export_plan_output.outputs.PLAN }}
+              ```
+            </details>
+
+            Once this PR is approved, copy the following text into a new comment to apply this plan:
+            ```
+            /apply ${{ matrix.environment }}
+            ```
+
+      - name: Add PR comment on failed plan
+        if: failure()
+        uses: peter-evans/create-or-update-comment@v4.0.0
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            :x: Terraform Plan Error for `${{ matrix.environment }}`:
+            <details>
+              <summary>Show Error</summary>
+
+              ```diff
+              ${{ steps.export_plan_output.outputs.PLAN }}
+              ```
+            </details>
+
+            :no_entry_sign: This error must be resolved before applying.

@@ -1,0 +1,161 @@
+name: Terraform Apply on PR Comment
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read  # For checking out private repos
+  issues: read  # For getting branch info via Issue info
+  id-token: write  # For AWS OIDC
+  pull-requests: write  # For making a PR comment
+  statuses: write  # For setting commit status
+
+env:
+  ENVIRONMENT: 'development'
+  AWS_ACCT_ID: 123  # Dev acct
+  IS_CICD_ROLE: true
+
+jobs:
+  terraform-apply:
+    if: github.event.issue.pull_request && startsWith(github.event.comment.body, '/apply')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Switch to production environment if requested
+        id: extract_vars
+        run: |
+          IFS=' ' read -r cmd environment <<< "${{ github.event.comment.body }}"
+          if [ "$environment" = "production" ]; then
+            echo "ENVIRONMENT=production" >> $GITHUB_ENV
+            echo "AWS_ACCT_ID=456" >> $GITHUB_ENV
+          fi
+
+      # The `issue_comment` trigger runs on main branch, not on the PR branch, counterintuitively.
+      - name: Get PR branch
+        id: get_pr_branch
+        uses: xt0rted/pull-request-comment-branch@v3.0.0
+
+      - name: Set PR status as pending completion of this workflow
+        uses: myrotvorets/set-commit-status-action@v2.0.1
+        with:
+          sha: ${{ steps.get_pr_branch.outputs.head_sha }}
+          status: pending
+          context: "${{ github.workflow }}: ${{ env.ENVIRONMENT }}"
+
+      - name: Verify PR approval
+        id: verify_pr_approval
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: prData } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            })
+            // We use PR mergeability as a proxy for PR approval.
+            // That means PRs need: a successful Plan, CODEOWNERS approval, & no unresolved comments.
+            // Approval by a non-code-owner doesn't count. (Because it doesn't make the PR mergeable)
+            // Note: we allow "unstable" state, below, because that state arises if a previous Apply has failed.
+            if (!['clean', 'unstable'].includes(prData.mergeable_state)) {
+              core.setFailed('PR is not mergeable. The Terraform Apply workflow requires CODEOWNERS approval & PR comment resolution.')
+            }
+
+      - name: Add PR comment if PR is not applyable
+        if: failure()
+        uses: peter-evans/create-or-update-comment@v4.0.0
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          body: |
+            :x: Terraform Apply error
+
+            PR is not mergeable. The Terraform Apply workflow requires CODEOWNERS approval & PR comment resolution.
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.get_pr_branch.outputs.head_ref }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCT_ID }}:role/BCI-Infrastructure-Github-Terraform
+          role-session-name: service-x-terraform-apply
+          aws-region: us-east-2
+
+      - name: Set Terraform and Terragrunt versions from .tool-versions
+        id: set_versions
+        run: |
+          echo "TF_VERSION=$(grep terraform .tool-versions | cut -d ' ' -f2)" >> $GITHUB_OUTPUT
+          echo "TG_VERSION=$(grep terragrunt .tool-versions | cut -d ' ' -f2)" >> $GITHUB_OUTPUT
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3.1.2
+        with:
+          terraform_version: ${{ steps.set_versions.outputs.TF_VERSION }}
+
+      - name: Install Terragrunt
+        uses: autero1/action-terragrunt@v3.0.2
+        with:
+          terragrunt_version: ${{ steps.set_versions.outputs.TG_VERSION }}
+
+      - name: Terraform init
+        working-directory: terraform/environments/${{ env.ENVIRONMENT }}/
+        run: terragrunt init -no-color
+
+      # TODO: Apply the specific plan from the "Terraform Plan" workflow, but it's a pain to pass the plan file around
+      - name: Terraform apply
+        id: tf_apply
+        working-directory: terraform/environments/${{ env.ENVIRONMENT }}/
+        run: terragrunt apply -no-color --auto-approve
+
+      - name: Export Apply output to Github env var
+        id: export_apply_output
+        if: always() && steps.verify_pr_approval.outcome == 'success'  # always() captures all errors, so we need to distinguish
+        working-directory: terraform/environments/${{ env.ENVIRONMENT }}/
+        run: |
+          echo "TF_APPLY<<EOF" >> $GITHUB_OUTPUT
+          # Format like Atlantis: move +/-/~ to front(ish) of line and change ~ to !
+          echo '${{ steps.tf_apply.outputs.stdout }}' | sed 's|^\([ ]*\)\(  [-+~]\)|\2\1|g' | sed 's|^  \~|  !|g' >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Add PR comment on successful apply
+        uses: peter-evans/create-or-update-comment@v4.0.0
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          body: |
+            :white_check_mark: Terraform Apply success for `${{ env.ENVIRONMENT }}`!
+            <details>
+              <summary>Show Apply</summary>
+
+              ```diff
+              ${{ steps.export_apply_output.outputs.TF_APPLY }}
+              ```
+            </details>
+
+      - name: Add PR comment on failed apply
+        if: always() && steps.verify_pr_approval.outcome == 'success' && steps.tf_apply.outcome == 'failure'  # always() captures all errors, so we need to distinguish
+        uses: peter-evans/create-or-update-comment@v4.0.0
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          body: |
+            :x: Terraform Apply error for `${{ env.ENVIRONMENT }}`:
+            ```diff
+            ${{ steps.tf_apply.outputs.stderr }}
+            ```
+
+            <details>
+              <summary>Show Full Output</summary>
+
+              ```diff
+              ${{ steps.export_apply_output.outputs.TF_APPLY }}
+              ```
+            </details>
+
+      - name: Set PR status based on workflow outcome
+        if: always()
+        uses: myrotvorets/set-commit-status-action@v2.0.1
+        with:
+          sha: ${{ steps.get_pr_branch.outputs.head_sha }}
+          status: ${{ job.status }}
+          context: "${{ github.workflow }}: ${{ env.ENVIRONMENT }}"
